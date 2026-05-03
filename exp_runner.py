@@ -24,7 +24,6 @@ from models.cd_and_fscore import chamfer_distance_and_f1_score
 import csv
 from collections import OrderedDict
 
-
 def get_class(kls):
     parts = kls.split('.')
     module = ".".join(parts[:-1])

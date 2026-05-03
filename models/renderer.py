@@ -6,32 +6,94 @@ from nerfacc import ContractionType, OccupancyGrid, ray_marching, \
     render_weight_from_alpha_patch_based, accumulate_along_rays_patch_based, \
     render_weight_from_alpha, accumulate_along_rays
 
-def extract_fields(bound_min, bound_max, resolution, query_func):
-    N = 64
-    X = torch.linspace(bound_min[0], bound_max[0], resolution).split(N)
-    Y = torch.linspace(bound_min[1], bound_max[1], resolution).split(N)
-    Z = torch.linspace(bound_min[2], bound_max[2], resolution).split(N)
-
-    u = np.zeros([resolution, resolution, resolution], dtype=np.float32)
-    with torch.no_grad():
-        for xi, xs in tqdm(enumerate(X)):
-            for yi, ys in enumerate(Y):
-                for zi, zs in enumerate(Z):
-                    xx, yy, zz = torch.meshgrid(xs, ys, zs)
-                    pts = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1)
-                    val = query_func(pts).reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy()
-                    u[xi * N: xi * N + len(xs), yi * N: yi * N + len(ys), zi * N: zi * N + len(zs)] = val
-    return u
-
-
 def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
-    u = extract_fields(bound_min, bound_max, resolution, query_func)
-    vertices, triangles = mcubes.marching_cubes(u, threshold)
-    b_max_np = bound_max.detach().cpu().numpy()
+    """
+    Extracts high-resolution meshes using Spatial Chunking to prevent RAM overflow.
+    Instead of building an O(N^3) array in RAM, it processes the volume in 256^3 blocks.
+    """
+    print(f"Extracting geometry at {resolution}^3 resolution using Memory-Safe Chunking...")
     b_min_np = bound_min.detach().cpu().numpy()
+    b_max_np = bound_max.detach().cpu().numpy()
 
-    vertices = vertices / (resolution - 1.0) * (b_max_np - b_min_np)[None, :] + b_min_np[None, :]
-    return vertices, triangles
+    # 256^3 = 16.7 million voxels (Takes only ~67 MB of RAM per chunk)
+    chunk_res = 256  
+    
+    # Step overlaps by 1 voxel to ensure seamless meshing across chunk boundaries
+    step = chunk_res - 1 
+    
+    X_global = torch.linspace(bound_min[0], bound_max[0], resolution)
+    Y_global = torch.linspace(bound_min[1], bound_max[1], resolution)
+    Z_global = torch.linspace(bound_min[2], bound_max[2], resolution)
+
+    all_vertices = []
+    all_triangles = []
+    vertex_offset = 0
+
+    x_steps = list(range(0, resolution - 1, step))
+    y_steps = list(range(0, resolution - 1, step))
+    z_steps = list(range(0, resolution - 1, step))
+    total_chunks = len(x_steps) * len(y_steps) * len(z_steps)
+
+    with tqdm(total=total_chunks, desc="Processing spatial chunks") as pbar:
+        for xi in x_steps:
+            xi_end = min(xi + chunk_res, resolution)
+            xs = X_global[xi:xi_end]
+            
+            for yi in y_steps:
+                yi_end = min(yi + chunk_res, resolution)
+                ys = Y_global[yi:yi_end]
+                
+                for zi in z_steps:
+                    zi_end = min(zi + chunk_res, resolution)
+                    zs = Z_global[zi:zi_end]
+                    
+                    # Build local grid coordinates for this specific chunk
+                    xx, yy, zz = torch.meshgrid(xs, ys, zs, indexing='ij')
+                    pts = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1)
+                    
+                    # Process points in GPU VRAM-safe mini-batches (64^3 points per batch)
+                    pts_split = torch.split(pts, 262144, dim=0) 
+                    
+                    val_list = []
+                    with torch.no_grad():
+                        for pts_batch in pts_split:
+                            # Move to GPU, query SDF, instantly move back to CPU
+                            val = query_func(pts_batch.cuda()).detach().cpu().numpy()
+                            val_list.append(val)
+                            
+                    # Assemble the 32-bit float chunk (Only 67 MB max)
+                    u_chunk = np.concatenate(val_list, axis=0).reshape(len(xs), len(ys), len(zs))
+                    
+                    # EMPTY SPACE SKIPPING: 
+                    # If the chunk is completely solid or completely empty, skip marching cubes
+                    if not (np.all(u_chunk > threshold) or np.all(u_chunk < threshold)):
+                        
+                        # Run marching cubes on this tiny memory-safe chunk
+                        vertices, triangles = mcubes.marching_cubes(u_chunk, threshold)
+                        
+                        if len(vertices) > 0:
+                            # Shift local chunk voxel coordinates to global voxel coordinates
+                            vertices[:, 0] += xi
+                            vertices[:, 1] += yi
+                            vertices[:, 2] += zi
+                            
+                            # Convert global voxel coordinates to physical world coordinates
+                            vertices = vertices / (resolution - 1.0) * (b_max_np - b_min_np)[None, :] + b_min_np[None, :]
+                            
+                            all_vertices.append(vertices)
+                            all_triangles.append(triangles + vertex_offset)
+                            vertex_offset += len(vertices)
+                            
+                    pbar.update(1)
+
+    if len(all_vertices) == 0:
+        return np.zeros((0, 3)), np.zeros((0, 3))
+        
+    print("Stitching chunks together...")
+    final_vertices = np.vstack(all_vertices)
+    final_triangles = np.vstack(all_triangles)
+    
+    return final_vertices, final_triangles
 
 
 class NeuSRenderer:
