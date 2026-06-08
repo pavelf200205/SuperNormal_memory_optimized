@@ -120,7 +120,7 @@ class Runner:
     def train(self):
         print("Start training...")
         self.writer = SummaryWriter(log_dir=os.path.join(self.base_exp_dir, 'logs'))
-        self.writer.add_graph(self.sdf_network, verbose=False, input_to_model=torch.randn(1, 3))
+        self.writer.add_graph(self.sdf_network, verbose=False, input_to_model=torch.randn(1, 3, device=self.device))
         self.update_learning_rate()
 
         # create a csv file to save the evaluation metrics
@@ -633,7 +633,9 @@ if __name__ == '__main__':
     import warnings
     warnings.filterwarnings("ignore")
 
-    torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    # VRAM optimization: removed torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    # All tensor creation now uses explicit device= to avoid hidden CUDA allocations
+    # and VRAM fragmentation from library code (nerfacc, etc.)
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--conf', type=str, default='./confs/base.conf')

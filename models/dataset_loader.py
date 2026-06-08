@@ -166,7 +166,7 @@ class Dataset:
         rays_right = self.pose_all[img_idx, :3, 0].expand(rays_v.shape)
         rays_down = self.pose_all[img_idx, :3, 1].expand(rays_v.shape)
         V_concat = torch.cat([rays_v[..., None, :], rays_right[..., None, :], rays_down[..., None, :]], dim=-2)
-        rays_V_inverse_all_image = torch.inverse(V_concat)
+        # VRAM optimization: invert only extracted patches instead of full (H, W, 3, 3) image
 
         height, width, _ = rays_v.shape
         horizontal_num_patch = width // patch_W
@@ -179,8 +179,8 @@ class Dataset:
                 rays_v_patch = rays_v[i:i + patch_H, j:j + patch_W]
                 rays_v_patches_all.append(rays_v_patch)
 
-                rays_V_inverse_patch = rays_V_inverse_all_image[i:i + patch_H, j:j + patch_W]
-                rays_V_inverse_patches_all.append(rays_V_inverse_patch)
+                V_patch = V_concat[i:i + patch_H, j:j + patch_W]
+                rays_V_inverse_patches_all.append(torch.inverse(V_patch))
                 
         rays_v_patches_all = torch.stack(rays_v_patches_all, dim=0)
         rays_V_inverse_patches_all = torch.stack(rays_V_inverse_patches_all, dim=0)  
