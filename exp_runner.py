@@ -24,6 +24,24 @@ from models.cd_and_fscore import chamfer_distance_and_f1_score
 import csv
 from collections import OrderedDict
 
+class MemTracker:
+    def __init__(self, log_path="detailed_vram_profile.csv"):
+        self.log_path = log_path
+        self.file = open(self.log_path, 'w', newline='')
+        self.writer = csv.writer(self.file)
+        self.writer.writerow(['step', 'tag', 'allocated_mb', 'peak_mb', 'reserved_mb'])
+        self.step = 0
+
+    def log(self, tag):
+        alloc = torch.cuda.memory_allocated() / 1024**2
+        peak = torch.cuda.max_memory_allocated() / 1024**2
+        resv = torch.cuda.memory_reserved() / 1024**2
+        self.writer.writerow([self.step, tag, f"{alloc:.2f}", f"{peak:.2f}", f"{resv:.2f}"])
+        self.file.flush()
+
+    def close(self):
+        self.file.close()
+
 def get_class(kls):
     parts = kls.split('.')
     module = ".".join(parts[:-1])
@@ -51,6 +69,13 @@ class Runner:
         self.end_iter = self.conf.get_int('train.end_iter')
         self.batch_size = self.conf.get_int('train.batch_size')
         self.patch_size = self.conf.get_int('train.patch_size', default=3)
+
+        # Dedicated Low VRAM Mode for GT1030 (2GB VRAM)
+        self.low_vram_mode = True
+        if self.low_vram_mode:
+            print("[INFO] LOW VRAM MODE ENABLED: Adjusting batch sizes for 2GB GPUs.")
+            self.batch_size = 1024  # Drastically reduce batch size
+            # self.conf["model.ray_marching"]["occ_update_freq"] *= 2  # Update occupancy grid less frequently
 
         self.learning_rate = self.conf.get_float('train.learning_rate')
         self.learning_rate_alpha = self.conf.get_float('train.learning_rate_alpha')
@@ -142,8 +167,15 @@ class Runner:
                                      'fscore'])
 
         res_step = self.end_iter - self.iter_step
+        
+        tracker = MemTracker()
+        
         pbar = tqdm(range(res_step))
         for iter_i in pbar:
+            tracker.step = iter_i
+            torch.cuda.reset_peak_memory_stats()
+            tracker.log("1_start_iteration")
+
             # update ray marching step size
             self.renderer.sampling_step_size = 10 ** (np.log10(self.start_step_size) - self.slop_step*iter_i)
 
@@ -152,6 +184,7 @@ class Runner:
                                                       occ_eval_fn=self.renderer.occ_eval_fn,
                                                       occ_thre=self.conf["model.ray_marching"]["occ_threshold"],
                                                       n=self.conf["model.ray_marching"]["occ_update_freq"])
+            tracker.log("2_after_occupancy_grid")
 
             # following neuralangelo, gradually increase ingp bandwidth
             if self.iter_step % self.increase_bindwidth_every == 0:
@@ -160,6 +193,7 @@ class Runner:
             # sample patches of pixels for training
             rays_o_patch_all, rays_d_patch_all, marching_plane_normal, V_inverse_patch_all, true_normal, mask = \
                 self.dataset.gen_random_patches(self.batch_size, patch_H=self.patch_size, patch_W=self.patch_size)
+            tracker.log("3_after_gen_random_patches")
 
             rays_o_patch_center = rays_o_patch_all[:, self.patch_size // 2, self.patch_size // 2]  # (num_patch, 3)
             rays_d_patch_center = rays_d_patch_all[:, self.patch_size // 2, self.patch_size// 2]  # (num_patch, 3)
@@ -177,6 +211,7 @@ class Runner:
                                               rays_d_patch_all,
                                               marching_plane_normal,
                                               near, far, V_inverse_patch_all)
+            tracker.log("4_after_forward_render")
 
             if render_out['gradients'] is None:  # all rays are in the zero region of the occupancy grid
                 self.update_learning_rate()
@@ -200,10 +235,13 @@ class Runner:
             loss = self.normal_weight * normal_loss + \
                    self.mask_weight * mask_loss + \
                    self.eikonal_weight * eikonal_loss
+            tracker.log("5_after_loss_computation")
 
             self.optimizer.zero_grad()
             loss.backward()
+            tracker.log("6_after_backward_pass")
             self.optimizer.step()
+            tracker.log("7_after_optimizer_step")
 
             self.iter_step += 1
             self.update_learning_rate()
@@ -214,6 +252,11 @@ class Runner:
                                               rm_step=f"{self.renderer.sampling_step_size.item():.3e}",
                                               samples_per_ray=f"{samples_per_ray:.1f}")
                 pbar.set_postfix(ordered_dict=message_postfix)
+                
+            del render_out, comp_normal, gradients, comp_mask, normal_error
+            del rays_o_patch_all, rays_d_patch_all, V_inverse_patch_all
+            del loss, normal_loss, eikonal_loss, mask_loss
+            tracker.log("8_after_manual_del")
 
             if self.iter_step % self.save_freq == 0:
                 self.save_checkpoint()
@@ -295,11 +338,18 @@ class Runner:
                 f.write(self.conf_text)
 
     def load_checkpoint(self, checkpoint_name):
-        checkpoint = torch.load(os.path.join(self.base_exp_dir, 'checkpoints', checkpoint_name), map_location=self.device)
+        # VRAM fix: load to CPU first to prevent massive GPU memory spike 
+        # that duplicates state_dict and fragments PyTorch's caching allocator
+        checkpoint = torch.load(os.path.join(self.base_exp_dir, 'checkpoints', checkpoint_name), map_location='cpu')
         self.sdf_network.load_state_dict(checkpoint['sdf_network_fine'])
         self.deviation_network.load_state_dict(checkpoint['variance_network_fine'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.iter_step = checkpoint['iter_step']
+        
+        # Explicitly free the CPU dictionary and clear CUDA cache 
+        # before the training loop starts
+        del checkpoint
+        torch.cuda.empty_cache()
         logging.info('End')
 
     def save_checkpoint(self):

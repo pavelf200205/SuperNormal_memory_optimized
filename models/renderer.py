@@ -115,12 +115,26 @@ class NeuSRenderer:
         self.sampling_step_size = 0.01  # ray marching step size, will be modified during training
         self.gradient_method = gradient_method   # dfd or fd or ad
 
+    def chunked_sdf_network(self, x, chunk_size=64*1024):
+        # Chunked evaluation wrapper to prevent tiny-cuda-nn from creating
+        # massive temporary VRAM workspace buffers when samples_per_ray grows.
+        out = []
+        for i in range(0, x.shape[0], chunk_size):
+            out.append(self.sdf_network(x[i:i+chunk_size]))
+        return torch.cat(out, dim=0)
 
+
+    @torch.no_grad()
     def occ_eval_fn(self, x):
         # function for updating the occ grid given the current sdf
-        sdf = self.sdf_network(x)[..., :1]
-        alpha = torch.sigmoid(- sdf * 80)  # occ grids with alpha below the occ threshold will be set as 0
-        return alpha
+        # chunked to prevent tiny-cuda-nn from allocating 2GB+ workspace buffers
+        # for 2 million points at once. Reduced to 64k for 2GB GT 1030
+        chunk_size = 64 * 1024
+        alphas = []
+        for i in range(0, x.shape[0], chunk_size):
+            sdf = self.sdf_network(x[i:i+chunk_size])[..., :1]
+            alphas.append(torch.sigmoid(- sdf * 80))
+        return torch.cat(alphas, dim=0)
 
 
     def render(self, rays_o_patch_all,  # (num_patch, patch_H, patch_W, 3)
@@ -159,7 +173,7 @@ class NeuSRenderer:
 
             positions_all = torch.cat([positions_starts, positions_ends_diff], 0)
 
-            sdf_all = self.sdf_network(positions_all)
+            sdf_all = self.chunked_sdf_network(positions_all)
             sdf_start = sdf_all[:positions_starts.shape[0]]
             sdf_end_diff = sdf_all[positions_starts.shape[0]:]
 
@@ -225,8 +239,8 @@ class NeuSRenderer:
 
         # Gradient checkpointing: eliminates ~200 MB of stored autograd activations
         # by recomputing the SDF forward pass during backward instead of caching it.
-        # Training results are mathematically identical.
-        sdf_all = torch_checkpoint(self.sdf_network, positions_all_flat, use_reentrant=False)
+        # Combined with chunking, this locks the peak VRAM down permanently.
+        sdf_all = torch_checkpoint(self.chunked_sdf_network, positions_all_flat, use_reentrant=False)
         sdf_all = sdf_all.reshape(*positions_all.shape[:-1], 1)
         del positions_all, positions_all_flat  # VRAM: no longer needed after reshape
 
@@ -317,7 +331,7 @@ class NeuSRenderer:
                 [positions_xn, positions_xp, positions_yn, positions_yp, positions_zn, positions_zp], 0).to(
                 torch.float32).reshape(-1, 3)
 
-            sdf_concat = self.sdf_network(positions_concat).reshape(-1, patch_H, patch_W, 1)
+            sdf_concat = self.chunked_sdf_network(positions_concat).reshape(-1, patch_H, patch_W, 1)
             num_samples = positions_starts_patch_all.shape[0]
             sdf_xn = sdf_concat[:num_samples].reshape(num_samples, patch_H, patch_W, 1)
             sdf_xp = sdf_concat[num_samples:2 * num_samples].reshape(num_samples, patch_H, patch_W, 1)
